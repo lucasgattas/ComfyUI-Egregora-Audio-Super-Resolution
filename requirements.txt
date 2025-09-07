@@ -1,0 +1,7 @@
+soundfile>=0.12
+numpy>=1.26
+tqdm>=4.66
+requests>=2.31
+huggingface_hub>=0.24
+fat-llama>=1.1.0
+fat-llama-fftw>=1.0.4.4
