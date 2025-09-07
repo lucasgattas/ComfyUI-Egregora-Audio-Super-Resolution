@@ -1,0 +1,47 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.log
+
+# Virtual environments
+venv/
+.env/
+.venv/
+env/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Editor configs
+.vscode/
+.idea/
+
+# ComfyUI outputs
+output/
+outputs/
+*.png
+*.jpg
+*.jpeg
+*.wav
+*.flac
+
+# Model + dependency folders (downloaded automatically via install.py)
+models/
+deps/
+checkpoints/
+
+# Hugging Face cache
+~/.cache/huggingface/
+hf_cache/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*.swo
