@@ -1,12 +1,8 @@
 # 🎧 ComfyUI — Egregora Audio Super‑Resolution
 
-Bring music up to studio‑grade sample‑rates right inside ComfyUI. This repo ships **three minimal, production‑oriented nodes**:
+Bring music up to studio‑grade sample rates right inside ComfyUI.
 
-* **Audio Super Resolution (FlashSR)** — one‑step diffusion upsampler (music‑friendly) ⚡
-* **Spectral Enhance (Fat Llama — GPU)** — CUDA/CuPy accelerated iterative spectral enhancer 🐍🧪
-* **Spectral Enhance (Fat Llama — CPU/FFTW)** — portable CPU fallback using pyFFTW 🧠
-
-Each node is designed to be simple, robust, and to play nicely with ComfyUI’s file I/O.
+This repo ships **three production‑oriented upscaling/enhancement nodes** and bundles a set of **integrated utility toolsets** (enhance, evaluation, null‑testing) so you can denoise → upscale → measure without wiring a huge graph.
 
 ---
 
@@ -17,55 +13,90 @@ custom_nodes/
   ComfyUI-Egregora-Audio-Super-Resolution/
     __init__.py
     egregora_audio_super_resolution.py   # FlashSR node
-    egregora_fat_llama_gpu.py            # Fat Llama (CUDA)
-    egregora_fat_llama_cpu.py            # Fat Llama (FFTW)
+    egregora_fat_llama_gpu.py            # Fat Llama (CUDA/CuPy)
+    egregora_fat_llama_cpu.py            # Fat Llama (CPU/FFTW)
+    egregora_audio_enhance_extras.py     # RNNoise / DeepFilterNet / WPE / DAC
+    egregora_audio_eval_pack.py          # ABX, Loudness/Match, Metrics, HQ Resample
+    egregora_null_test_suite.py          # Align, Gain‑Match, Null, Plots
     flashsr_min.py                       # Light wrapper for FlashSR
-    install.py                           # Repo + weights bootstrapper
+    install.py                           # Repo + weights/deps bootstrapper
     requirements.txt
     deps/
       FlashSR_Inference/                 # pulled automatically on install
 ```
 
+### Core nodes
+
+* **Audio Super Resolution (FlashSR)** — one‑step diffusion upsampler (music‑friendly) ⚡
+* **Spectral Enhance (Fat Llama — GPU)** — CUDA/CuPy accelerated iterative spectral enhancer 🐍🧪
+* **Spectral Enhance (Fat Llama — CPU/FFTW)** — portable CPU fallback using pyFFTW 🧠
+
+### Integrated utility toolsets (used inside the SR nodes)
+
+* **Enhance — Extras**
+
+  * RNNoise Denoise (48 kHz, adaptive mix, strength, post‑gain)
+  * DeepFilterNet 2/3 Denoise (48 kHz native)
+  * WPE Dereverb (nara‑wpe)
+  * DAC Encode/Decode (Descript Audio Codec)
+* **Eval Pack**
+
+  * ABX prepare/judge clips
+  * Loudness meter (BS.1770), Gain‑Match (LUFS/RMS)
+  * Metrics: SI‑SDR, Log‑Spectral Distance (LSD)
+  * High‑quality resampler (SciPy/torch fallbacks)
+* **Null Test Suite**
+
+  * Align (XCorr GCC‑PHAT), Gain‑Match, Null, difference plots
+
+> These helpers are wired so you can ABX / null‑test right from the SR node panel.
+
 ---
 
 ## 🧩 Install (ComfyUI portable or venv)
 
-1. **Drop the folder** into `ComfyUI/custom_nodes/` and restart ComfyUI once.
+1. **Copy the folder** to `ComfyUI/custom_nodes/` and restart ComfyUI once.
 
-2. **Install Python deps** (ComfyUI’s Python):
+2. **Install Python deps** using ComfyUI’s Python:
 
 ```bash
 # From ComfyUI root
 python -m pip install -r custom_nodes/ComfyUI-Egregora-Audio-Super-Resolution/requirements.txt
+python custom_nodes/ComfyUI-Egregora-Audio-Super-Resolution/install.py
 ```
+
+* We **do not** install `torch/torchaudio` here to avoid breaking ComfyUI’s CUDA build.
+* First run will:
+
+  * clone `deps/FlashSR_Inference/`
+  * check for FlashSR weights
+  * warm up DeepFilterNet / DAC / RNNoise caches for smoother first use
 
 3. **FlashSR repo & weights**
 
-* The node bootstraps the upstream code automatically:
+* The node pulls the upstream inference code automatically into `deps/FlashSR_Inference/`.
+* Place weights in `ComfyUI/models/audio/flashsr/` with **exact** filenames:
 
-  * Downloads `FlashSR_Inference` zip to `deps/FlashSR_Inference`.
-  * Looks for weights at `models/audio/flashsr/` with exact names:
-
-    * `student_ldm.pth`, `sr_vocoder.pth`, `vae.pth`.
-* If you want the node to pull weights from your Hugging Face repo, set:
+  * `student_ldm.pth`, `sr_vocoder.pth`, `vae.pth`
+* Or set an env var to auto‑download from your HF repo:
 
 ```bash
-# optional: point to your private/public HF repo containing the three files
-set EGREGORA_FLASHSR_HF_REPO=yourname/flashsr-weights   # Windows (cmd)
-export EGREGORA_FLASHSR_HF_REPO=yourname/flashsr-weights # macOS/Linux
+# point to a HF repo containing those three files
+# Windows (cmd)
+set EGREGORA_FLASHSR_HF_REPO=yourname/flashsr-weights
+# macOS/Linux
+export EGREGORA_FLASHSR_HF_REPO=yourname/flashsr-weights
 ```
 
-> Tip: you can also place the files manually in `ComfyUI/models/audio/flashsr/`.
+4. **GPU extras (for the Fat‑Llama GPU node)**
 
-4. **GPU extras (only for the CUDA Fat‑Llama node)**
-
-* Install a CuPy wheel that matches your CUDA runtime (e.g., CUDA 12):
+Install a CuPy wheel matching your CUDA (example for CUDA 12):
 
 ```bash
 python -m pip install "cupy-cuda12x>=13.0"
 ```
 
-* On Windows, if you hit `vector_types.h` / NVRTC errors, install NVIDIA runtime DLLs:
+If Windows shows NVRTC / `vector_types.h` errors, install the CUDA runtime DLL wheels:
 
 ```bash
 python -m pip install -U nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 \
@@ -73,11 +104,9 @@ python -m pip install -U nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 \
   nvidia-cusolver-cu12 nvidia-cusparse-cu12
 ```
 
-* You also need **FFmpeg** on PATH for reading/encoding audio. The simplest path:
+5. **FFmpeg**
 
-  * Windows: `winget install --id Gyan.FFmpeg.Full` or install via \[ffmpeg.org].
-  * macOS: `brew install ffmpeg`
-  * Linux: `sudo apt-get install ffmpeg`
+Ensure FFmpeg is on your PATH for reading/encoding audio.
 
 ---
 
@@ -85,106 +114,65 @@ python -m pip install -U nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 \
 
 `requirements.txt` keeps things lean:
 
-* `soundfile`, `numpy`, `tqdm`, `requests`, `huggingface_hub`
-* `fat-llama` (GPU node) and `fat-llama-fftw` (CPU node)
+* Core: `soundfile`, `numpy`, `tqdm`, `requests`, `huggingface_hub`
+* SR/enhance: `fat-llama`, `fat-llama-fftw`, `pyrnnoise`, `deepfilternet` (import as `df`), `nara-wpe` (import as `nara_wpe`), `descript-audio-codec`
+* Optional: `scipy` for HQ resampler/metrics
 
-Install via the command in the Install section above.
+> Booleans in node UIs use the `BOOLEAN` datatype in `INPUT_TYPES` (proper toggle).
 
 ---
 
-## 🛠️ Nodes & settings
+## 🛠️ Nodes & key settings
 
 ### 1) **Audio Super Resolution (FlashSR)**
 
-Music‑friendly diffusion upsampler. Chunks the waveform, overlaps, and stitches seamlessly.
+* Chunks → overlap‑add → stitches to 48 kHz (or chosen target).
+* **Inputs**: `chunk_seconds` (default 5.12), `overlap_seconds` (0.5–0.75 if seams), `device`, `target_sr`, `output_format`, `audio_path` / `audio_url`, `flashsr_lowpass` (gentle LPF).
+* **Outputs**: **AUDIO** buffer + saved file.
 
-**Inputs**
+### 2) **Spectral Enhance (Fat Llama — GPU/CPU)**
 
-* `chunk_seconds` *(float, default 5.12)* — window size per pass. 5.12s matches upstream training length; stick with it for best quality.
-* `overlap_seconds` *(float, default 0.50)* — crossfade overlap; increase a bit (0.5–0.75) if you hear seams.
-* `device` *(auto|cpu|cuda)* — pick GPU for speed if available.
-* `target_sr` *(int|auto)* — 48 000 is common for music. `auto` keeps input rate when appropriate.
-* `output_format` *(wav|flac)* — select container/codec for the node’s file output.
-* `audio_path` / `audio_url` — optional direct file/URL sources.
-* `flashsr_lowpass` *(bool)* — applies a light LPF to better match training distribution; toggle if highs feel brittle.
+* Iterative soft‑thresholding with spectral post.
+* **Inputs**: `max_iterations`, `threshold_value`, `target_bitrate_kbps`, `toggle_autoscale`, `target_format`, `audio_path` / `audio_url`.
+* **Outputs**: **AUDIO** buffer + saved file.
 
-**Outputs**
+### Utility toolsets (used inside SR nodes)
 
-* **AUDIO** — 48 kHz (or chosen) waveform buffer + file on disk in your chosen format.
-
-**Notes**
-
-* The node will use `models/audio/flashsr/*.pth` automatically.
-* On first run, upstream repo is pulled into `deps/FlashSR_Inference/`.
-
----
-
-### 2) **Spectral Enhance (Fat Llama — GPU)**
-
-Fast CuPy/CUDA implementation of iterative soft‑thresholding + spectral post.
-
-**Inputs**
-
-* `target_format` *(wav|flac)* — output container/codec.
-* `max_iterations` *(int, default 300)* — more = longer + potentially more over‑sharpening. 300–600 is a good range.
-* `threshold_value` *(0–1, default 0.60)* — lower = gentler, higher = sparser/more aggressive.
-* `target_bitrate_kbps` *(int, default 1411)* — used to choose an upscale factor; set near CD PCM (1411) for full‑band music.
-* `toggle_autoscale` *(bool, default true)* — auto headroom gain to avoid clipping.
-* `audio_path` / `audio_url` — optional sources.
-
-**Outputs**
-
-* **AUDIO** — processed waveform + rendered file.
-
-**GPU gotchas**
-
-* If CuPy compiles kernels at first run, allow a few seconds.
-* If you see NVRTC / missing DLL errors on Windows, follow the CUDA extras in **Install**.
-
----
-
-### 3) **Spectral Enhance (Fat Llama — CPU/FFTW)**
-
-Drop‑in replacement when you don’t have a compatible GPU.
-
-**Inputs** are the same as the GPU node.
-
-**Performance**: expect \~×3–×10 slower than CUDA depending on CPU and audio length.
+* **Denoise/Dereverb**: RNNoise, DeepFilterNet 2/3, WPE
+* **Codec**: DAC encode/decode
+* **Eval**: ABX clips + judge, BS.1770 loudness, gain‑match, SI‑SDR, LSD
+* **Null**: Align → match → null + difference plots
 
 ---
 
 ## 🎚️ Quality tips (music)
 
-* **FlashSR first, Llama second**: For low‑rate sources (e.g., 12–24 kHz or lossy), run FlashSR to 48 kHz, then do a light Fat Llama pass (`max_iterations≈200`, `threshold_value≈0.5`) if you want a touch more sparkle.
-* **Crossfade overlap**: if you hear subtle ticks between chunks, nudge `overlap_seconds` up by 0.1–0.2.
-* **Don’t over‑iterate**: very high iterations or high threshold can sound brittle/phasey.
+* **FlashSR first, Llama second**: upscale to 48k, then a *light* Llama pass (`iterations≈200`, `threshold≈0.5`) if you want a touch of sparkle.
+* **Overlap**: If you hear ticks between chunks, raise `overlap_seconds` a bit.
+* **Don’t over‑iterate**: very high iterations/threshold can sound brittle.
 
 ---
 
 ## 🔍 Licenses (upstream projects)
 
-* **Fat‑Llama (GPU)**: published on PyPI under **BSD‑3‑Clause**. See PyPI page for details.
-  Ref: fat‑llama on PyPI.
-* **Fat‑Llama‑FFTW (CPU)**: published on PyPI under **BSD‑3‑Clause**. See PyPI page for details.
-  Ref: fat‑llama‑fftw on PyPI.
-* **FlashSR\_Inference** (upstream code): as of this writing, the repository does **not** include a LICENSE file in the root. Check the upstream README/commits for updates.
-
-> This ComfyUI integration code is distributed under the license declared in this repository.
+* **Fat‑Llama / fat‑llama‑fftw**: BSD‑3‑Clause (see PyPI).
+* **FlashSR_Inference**: check upstream repo for license status.
+* This ComfyUI integration is licensed as per this repository’s LICENSE.
 
 ---
 
 ## 🧪 Troubleshooting
 
-* **FlashSR import error**: After installing the node, restart ComfyUI so `install.py` can clone `FlashSR_Inference` and create `deps/FlashSR_Inference/`. If you keep seeing the error, remove `deps/FlashSR_Inference/` and restart.
-* **Missing FlashSR weights**: Put `student_ldm.pth`, `sr_vocoder.pth`, `vae.pth` in `models/audio/flashsr/` or set `EGREGORA_FLASHSR_HF_REPO` and restart.
-* **Windows CUDA compile / `vector_types.h`**: install the `nvidia-*‑cu12` wheels listed in **Install → GPU extras** and ensure your CuPy wheel matches CUDA.
-* **FFmpeg not found**: install FFmpeg and ensure it’s on PATH (see **Install**). Most issues with reading MP3/FLAC are solved by a system FFmpeg.
+* **FlashSR import error**: delete `deps/FlashSR_Inference/` and restart to re‑bootstrap.
+* **Missing FlashSR weights**: place the 3 files in `models/audio/flashsr/` or set `EGREGORA_FLASHSR_HF_REPO`.
+* **CUDA/CuPy NVRTC errors (Windows)**: install the `nvidia-*-cu12` runtime wheels listed above and ensure your CuPy wheel matches CUDA.
+* **FFmpeg not found**: install FFmpeg and ensure it’s on PATH.
 
 ---
 
 ## 🙌 Credits
 
-* FlashSR research & inference code by the original authors. See upstream repo.
+* FlashSR research & inference code by the original authors.
 * Fat Llama packages by RaAd (PyPI maintainer).
 * ComfyUI integration & node UX by Egregora.
 
@@ -194,4 +182,5 @@ Happy upsampling! 🎶
 
 ## 📜 Changelog
 
+* **v0.2.0** — Added Enhance/Eval/Null toolsets; new installer + warmups.
 * **v0.1.0** — Initial release: FlashSR SR node, Fat Llama GPU/CPU.
