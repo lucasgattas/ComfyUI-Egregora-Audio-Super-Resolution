@@ -1,13 +1,15 @@
 import os, sys, time, tempfile
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 import numpy as np
 import soundfile as sf
 import torch
 
-RETURN_TYPES = ("AUDIO",)
+# Extended outputs: main AUDIO + (ABX A,B,X,meta) + (null audio + metrics)
+RETURN_TYPES = ("AUDIO", "AUDIO", "AUDIO", "AUDIO", "DICT", "AUDIO", "DICT")
 FUNCTION = "run"
 CATEGORY = "Egregora/Audio"
+
 
 # ---------- paths ----------
 def _custom_root() -> Path:
@@ -19,14 +21,17 @@ def _custom_root() -> Path:
     # fallback: 3 dirs up (usual ComfyUI layout)
     return Path(__file__).resolve().parents[3]
 
+
 def _models_dir() -> Path:
     env = os.environ.get("EGREGORA_MODELS_DIR")
     return Path(env) if env else (_custom_root() / "models")
+
 
 def _audio_models_subdir(name: str) -> Path:
     d = _models_dir() / "audio" / name
     d.mkdir(parents=True, exist_ok=True)
     return d
+
 
 def _output_dir() -> Path:
     # Put sidecar files under ComfyUI/output/audio
@@ -34,6 +39,7 @@ def _output_dir() -> Path:
     out = root / "output" / "audio"
     out.mkdir(parents=True, exist_ok=True)
     return out
+
 
 # ---------- I/O helpers ----------
 def _to_cs(x: np.ndarray) -> np.ndarray:
@@ -52,10 +58,12 @@ def _to_cs(x: np.ndarray) -> np.ndarray:
         a = a / (m + 1e-8)
     return a.astype(np.float32)
 
+
 def _save_temp_wav(cs: np.ndarray, sr: int) -> Path:
     p = Path(tempfile.gettempdir()) / f"eg_in_{int(time.time()*1000)}.wav"
     sf.write(str(p), cs.T, sr)
     return p
+
 
 def _resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     """Simple linear resampler. x: [C, S]"""
@@ -69,6 +77,16 @@ def _resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
         return np.interp(t_out, t_in, x).astype(np.float32)
     out = np.stack([np.interp(t_out, t_in, ch) for ch in x], axis=0).astype(np.float32)
     return out
+
+
+def _make_audio(sr: int, samples_cn: np.ndarray, meta: Optional[dict] = None) -> Dict[str, Any]:
+    """Build a ComfyUI-compatible AUDIO dict that also includes 'samples' for our helpers."""
+    s = np.asarray(samples_cn, dtype=np.float32)
+    if s.ndim == 1:
+        s = s[None, :]
+    wf = torch.from_numpy(s).unsqueeze(0).contiguous()  # [1,C,T]
+    return {"sample_rate": int(sr), "waveform": wf, "samples": s, "meta": dict(meta or {})}
+
 
 # ---------- chunking ----------
 def _chunker(wav_path: Path, seconds: float, overlap: float) -> List[Tuple[Path, float, int]]:
@@ -99,6 +117,7 @@ def _chunker(wav_path: Path, seconds: float, overlap: float) -> List[Tuple[Path,
         i += hop
     return out
 
+
 def _overlap_add_multich(chunks: List[Tuple[np.ndarray, int, float]], seconds: float, overlap: float) -> Tuple[np.ndarray, int]:
     """
     Multi-channel overlap-add with Hann window, preserving channels.
@@ -106,7 +125,7 @@ def _overlap_add_multich(chunks: List[Tuple[np.ndarray, int, float]], seconds: f
     Returns (out_cs [C,S], sr)
     """
     if not chunks:
-        return np.zeros((1,1), np.float32), 48000
+        return np.zeros((1, 1), np.float32), 48000
     sr = int(chunks[0][1])
     win = max(1, int(seconds * sr))
     ends, C0 = [], None
@@ -131,6 +150,7 @@ def _overlap_add_multich(chunks: List[Tuple[np.ndarray, int, float]], seconds: f
     wsum[wsum == 0] = 1.0
     out = acc / wsum[None, :]
     return out.astype(np.float32), sr
+
 
 # ---------- FlashSR runner ----------
 class _FlashSRRunner:
@@ -250,6 +270,7 @@ class _FlashSRRunner:
         sf.write(str(out_wav), out.T, self.REQ_SR)
         return out_wav
 
+
 # ---------- Node ----------
 class EgregoraAudioSuperResolution:
     @classmethod
@@ -258,15 +279,24 @@ class EgregoraAudioSuperResolution:
             "required": {
                 "chunk_seconds": ("FLOAT", {"default": 5.12, "min": 1.0, "max": 120.0, "step": 0.01}),
                 "overlap_seconds": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 5.0, "step": 0.01}),
-                "device": (["auto","cuda","cpu"],),
-                "target_sr": (["auto","48000","44100","32000","22050","16000"],),
-                "output_format": (["wav","flac"],),  # <-- restored
+                "device": (["auto", "cuda", "cpu"],),
+                "target_sr": (["auto", "48000", "44100", "32000", "22050", "16000"],),
+                "output_format": (["wav", "flac"],),  # container decided by extension
             },
             "optional": {
                 "AUDIO": ("AUDIO",),
                 "audio_path": ("STRING", {"default": ""}),
                 "audio_url": ("STRING", {"default": ""}),
                 "flashsr_lowpass": ("BOOLEAN", {"default": False}),
+
+                # ABX helpers
+                "run_abx": ("BOOLEAN", {"default": False}),
+                "clip_seconds": ("FLOAT", {"default": 10.0, "min": 1.0, "max": 60.0, "step": 0.1}),
+                "random_seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1, "step": 1}),
+                "start_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10000.0, "step": 0.1}),
+
+                # Null-test helper
+                "run_null": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -286,7 +316,7 @@ class EgregoraAudioSuperResolution:
             cs = wf.detach().cpu().float().numpy()
             return cs, sr, _save_temp_wav(cs, sr)
 
-        if isinstance(AUDIO, (list,tuple)) and len(AUDIO)==2:
+        if isinstance(AUDIO, (list, tuple)) and len(AUDIO) == 2:
             arr, sr = AUDIO
             cs = _to_cs(np.asarray(arr))
             return cs, int(sr), _save_temp_wav(cs, int(sr))
@@ -302,19 +332,24 @@ class EgregoraAudioSuperResolution:
         if audio_url:
             import requests
             r = requests.get(audio_url, timeout=60); r.raise_for_status()
-            p = Path(tempfile.gettempdir())/f"eg_url_{int(time.time()*1000)}.wav"; p.write_bytes(r.content)
+            p = Path(tempfile.gettempdir()) / f"eg_url_{int(time.time()*1000)}.wav"; p.write_bytes(r.content)
             y, sr = sf.read(str(p), dtype="float32", always_2d=False)
             cs = _to_cs(y)
             return cs, int(sr), _save_temp_wav(cs, int(sr))
 
         raise RuntimeError("No AUDIO provided.")
 
-    def run(self, chunk_seconds, overlap_seconds, device, target_sr, output_format,
-            AUDIO=None, audio_path="", audio_url="", flashsr_lowpass=False):
+    def run(
+        self, chunk_seconds, overlap_seconds, device, target_sr, output_format,
+        AUDIO=None, audio_path="", audio_url="", flashsr_lowpass=False,
+        run_abx=False, clip_seconds=10.0, random_seed=0, start_seconds=0.0,
+        run_null=False
+    ):
+        # ---------- Normalize input ----------
+        target_sr_int = 0 if target_sr == "auto" else int(target_sr)
+        in_cs, in_sr, in_wav = self._normalize_audio(AUDIO, audio_path, audio_url)
 
-        target_sr_int = 0 if target_sr=="auto" else int(target_sr)
-        cs, in_sr, in_wav = self._normalize_audio(AUDIO, audio_path, audio_url)
-
+        # ---------- FlashSR over chunks ----------
         chunks = _chunker(in_wav, seconds=chunk_seconds, overlap=overlap_seconds)
         rendered: List[Tuple[np.ndarray, int, float]] = []
 
@@ -333,16 +368,60 @@ class EgregoraAudioSuperResolution:
 
         out_cs, out_sr = _overlap_add_multich(rendered, chunk_seconds, overlap_seconds)
 
-        # Return AUDIO for Comfy graph
-        wf = torch.from_numpy(out_cs).unsqueeze(0).contiguous()  # [1,C,T]
+        # ---------- Main AUDIO out ----------
+        main_audio = _make_audio(int(out_sr), out_cs)
 
-        # Also write a sidecar file to ComfyUI/output/audio in chosen container
+        # write sidecar file to ComfyUI/output/audio in chosen container
         ext = ".wav" if output_format == "wav" else ".flac"
         out_file = _output_dir() / f"flashsr_{int(time.time()*1000)}{ext}"
         sf.write(str(out_file), out_cs.T, int(out_sr))  # container chosen by extension
         print(f"[FlashSR] Wrote: {out_file}")
 
-        return ({"waveform": wf, "sample_rate": int(out_sr)},)
+        # ---------- Optional ABX prep ----------
+        abx_A = _make_audio(int(out_sr), _resample_linear(in_cs, in_sr, int(out_sr)))  # resample original to out_sr
+        abx_B = main_audio
+        abx_X = _make_audio(int(out_sr), np.zeros((abx_B['samples'].shape[0], 1), np.float32))
+        abx_meta: Dict[str, Any] = {}
+
+        if bool(run_abx):
+            try:
+                from .egregora_audio_eval_pack import ABX_Prepare  # local helper node
+            except Exception:
+                # fallback to plain prep if the module path differs (e.g., running as a single file)
+                from egregora_audio_eval_pack import ABX_Prepare  # type: ignore
+
+            A_c, B_c, X, meta = ABX_Prepare().execute(
+                abx_A, abx_B, clip_seconds=float(clip_seconds),
+                random_seed=int(random_seed), start_seconds=float(start_seconds)
+            )
+            abx_A, abx_B, abx_X, abx_meta = A_c, B_c, X, dict(meta)
+
+        # ---------- Optional Null test (no plots, just signal+metrics) ----------
+        null_audio = _make_audio(int(out_sr), np.zeros((abx_B['samples'].shape[0], 1), np.float32))
+        null_metrics: Dict[str, Any] = {}
+
+        if bool(run_null):
+            try:
+                from .egregora_null_test_suite import Null_Test_Full
+            except Exception:
+                from egregora_null_test_suite import Null_Test_Full  # type: ignore
+
+            ap_matched, audio_null, delay_ms, gain_db, metrics, _w, _s, _d = Null_Test_Full().execute(
+                audio_ref=abx_A,
+                audio_proc=main_audio,
+                # keep it lightweight: no figures
+                draw_waveforms=False, draw_spectrograms=False, draw_diffspec=False
+            )
+            # we expose only the null and metrics here
+            null_audio = audio_null
+            # include alignment/gain in metrics for convenience
+            mm = dict(metrics or {})
+            mm.update({"delay_ms": float(delay_ms), "gain_db": float(gain_db)})
+            null_metrics = mm
+
+        # Return all outputs (unused ones are harmless)
+        return (main_audio, abx_A, abx_B, abx_X, abx_meta, null_audio, null_metrics)
+
 
 # ComfyUI node registration
 NODE_CLASS_MAPPINGS = {
