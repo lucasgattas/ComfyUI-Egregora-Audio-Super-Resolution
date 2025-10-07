@@ -1,7 +1,15 @@
-soundfile>=0.12
+# Core
 numpy>=1.26
+scipy>=1.11
+soundfile>=0.12
 tqdm>=4.66
 requests>=2.31
 huggingface_hub>=0.24
+
+# Models / processors used by your nodes
 fat-llama>=1.1.0
 fat-llama-fftw>=1.0.4.4
+pyrnnoise>=0.3.8
+nara-wpe>=0.0.9          # import name: nara_wpe
+deepfilternet>=0.5.6     # import name: df
+descript-audio-codec>=1.0.0
