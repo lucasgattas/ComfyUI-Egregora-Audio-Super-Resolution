@@ -75,6 +75,7 @@ python custom_nodes/ComfyUI-Egregora-Audio-Super-Resolution/install.py
 3. **FlashSR repo & weights**
 
 * The node pulls the upstream inference code automatically into `deps/FlashSR_Inference/`.
+* This node does not include FlashSR code or weights. The commonly referenced FlashSR_Inference repo currently lacks a license. Unless you have explicit permission from the rights holder(s), do not use FlashSR code/weights for commercial purposes. Proceed at your own risk.
 * Place weights in `ComfyUI/models/audio/flashsr/` with **exact** filenames:
 
   * `student_ldm.pth`, `sr_vocoder.pth`, `vae.pth`
