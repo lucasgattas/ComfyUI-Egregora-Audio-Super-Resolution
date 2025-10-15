@@ -1,208 +1,230 @@
-import os, sys, time, tempfile
+# 🎧 ComfyUI — Audio Super Resolution (FlashSR)
+# Minimal, single-output node with robust shapes and HQ resampling.
+# Inputs:  audio (AUDIO), lowpass_input (BOOL), output_sr (enum)
+# Output:  audio (AUDIO)
+#
+# Internals:
+# - Normalize to [C, S] consistently (soundfile returns [S, C] -> transpose)
+# - Fixed chunking: 5.12 s, overlap: 0.50 s, Hann WOLA stitching
+# - Inference at 48 kHz (FlashSR’s design target), optional post-resample
+# - HQ SRC cascade: soxr -> scipy.signal.resample_poly -> torchaudio -> linear
+#
+# SPDX: MIT
+
+import os, sys, time
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
+
 import numpy as np
-import soundfile as sf
 import torch
 
-# Extended outputs: main AUDIO + (ABX A,B,X,meta) + (null audio + metrics)
-RETURN_TYPES = ("AUDIO", "AUDIO", "AUDIO", "AUDIO", "DICT", "AUDIO", "DICT")
 FUNCTION = "run"
 CATEGORY = "Egregora/Audio"
 
-
 # ---------- paths ----------
 def _custom_root() -> Path:
-    p = Path(__file__).resolve()
-    for _ in range(10):
-        if (p.parent / "models").exists() or (p.parent / "output").exists():
-            return p.parent
-        p = p.parent
-    # fallback: 3 dirs up (usual ComfyUI layout)
-    return Path(__file__).resolve().parents[3]
-
+    return Path(__file__).resolve().parent
 
 def _models_dir() -> Path:
-    env = os.environ.get("EGREGORA_MODELS_DIR")
-    return Path(env) if env else (_custom_root() / "models")
-
+    # .../ComfyUI/models
+    return _custom_root().parents[2] / "models"
 
 def _audio_models_subdir(name: str) -> Path:
     d = _models_dir() / "audio" / name
     d.mkdir(parents=True, exist_ok=True)
     return d
 
-
-def _output_dir() -> Path:
-    # Put sidecar files under ComfyUI/output/audio
-    root = _custom_root()
-    out = root / "output" / "audio"
-    out.mkdir(parents=True, exist_ok=True)
-    return out
-
-
-# ---------- I/O helpers ----------
-def _to_cs(x: np.ndarray) -> np.ndarray:
-    """Return channels-first float32 [C, S]. Accepts [S], [S, C], [C, S]."""
-    a = np.asarray(x, dtype=np.float32)
-    if a.ndim == 1:
-        a = a[None, :]
-    elif a.ndim == 2:
-        h, w = a.shape
-        if w <= 8 and h > w:  # soundfile often gives [S,C]
-            a = a.T
-    else:
-        a = a.reshape(-1)[None, :]
-    m = np.max(np.abs(a)) if a.size else 0.0
-    if m > 1.0:
-        a = a / (m + 1e-8)
-    return a.astype(np.float32)
-
-
-def _save_temp_wav(cs: np.ndarray, sr: int) -> Path:
-    p = Path(tempfile.gettempdir()) / f"eg_in_{int(time.time()*1000)}.wav"
-    sf.write(str(p), cs.T, sr)
-    return p
-
-
-def _resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-    """Simple linear resampler. x: [C, S]"""
-    if src_sr == dst_sr:
-        return x
-    ratio = dst_sr / src_sr
-    n_out = int(round(x.shape[-1] * ratio))
-    t_in = np.linspace(0.0, 1.0, x.shape[-1], endpoint=False, dtype=np.float64)
-    t_out = np.linspace(0.0, 1.0, n_out, endpoint=False, dtype=np.float64)
-    if x.ndim == 1:
-        return np.interp(t_out, t_in, x).astype(np.float32)
-    out = np.stack([np.interp(t_out, t_in, ch) for ch in x], axis=0).astype(np.float32)
-    return out
-
-
-def _make_audio(sr: int, samples_cn: np.ndarray, meta: Optional[dict] = None) -> Dict[str, Any]:
-    """Build a ComfyUI-compatible AUDIO dict that also includes 'samples' for our helpers."""
-    s = np.asarray(samples_cn, dtype=np.float32)
+# ---------- AUDIO helpers ----------
+def _make_audio(sr: int, samples_cs: np.ndarray) -> Dict[str, Any]:
+    """Build a ComfyUI AUDIO dict from [C, S] float32."""
+    s = np.asarray(samples_cs, dtype=np.float32)
     if s.ndim == 1:
         s = s[None, :]
-    wf = torch.from_numpy(s).unsqueeze(0).contiguous()  # [1,C,T]
-    return {"sample_rate": int(sr), "waveform": wf, "samples": s, "meta": dict(meta or {})}
+    C, T = s.shape
+    wf = torch.from_numpy(s).unsqueeze(0).contiguous()  # [1, C, T]
+    return {"waveform": wf, "sample_rate": int(sr)}
 
+def _from_audio_dict(AUDIO: Any) -> Tuple[np.ndarray, int]:
+    """
+    Accept Comfy AUDIO dict or (ndarray, sr). Return [C, S] float32 and sr.
+    """
+    # Comfy AUDIO dict
+    if isinstance(AUDIO, dict) and "waveform" in AUDIO and "sample_rate" in AUDIO:
+        wf: torch.Tensor = AUDIO["waveform"]
+        sr = int(AUDIO["sample_rate"])
+        if wf.dim() == 3:
+            wf = wf[0]  # [C, T]
+        if wf.dim() != 2:
+            raise RuntimeError(f"Unexpected AUDIO tensor shape {tuple(wf.shape)}; expected [C, T].")
+        cs = wf.detach().cpu().float().numpy()  # [C, T]
+        return cs, sr
+    # (array, sr)
+    if isinstance(AUDIO, (list, tuple)) and len(AUDIO) == 2:
+        arr, sr = AUDIO
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim == 1:
+            # mono [S] -> [1, S]
+            cs = arr[None, :]
+        elif arr.ndim == 2:
+            # could be [S, C] or [C, S]; treat 1st dim as frames if it's much larger
+            if arr.shape[0] >= arr.shape[1] and arr.shape[1] <= 8:
+                # soundfile/frames-first -> transpose to [C, S]
+                cs = arr.T
+            else:
+                cs = arr  # already [C, S]
+        else:
+            cs = arr.reshape(1, -1)
+        return cs.astype(np.float32), int(sr)
+    raise RuntimeError("No valid AUDIO provided.")
 
-# ---------- chunking ----------
-def _chunker(wav_path: Path, seconds: float, overlap: float) -> List[Tuple[Path, float, int]]:
+# ---------- HQ resampling ----------
+def _resample_hq(x_cs: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     """
-    Split *without downmixing*; preserve channels.
-    Returns: list of (chunk_path, start_seconds, sr).
+    Prefer soxr -> scipy.signal.resample_poly -> torchaudio -> linear.
+    Operates on [C, S] along the sample axis.
     """
-    y, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
-    if y.ndim == 1:
-        y = y[:, None]  # [S] -> [S,1]
-    n = y.shape[0]
-    win = int(seconds * sr)
-    if n <= win:
-        tmp = Path(tempfile.gettempdir()) / f"eg_chunk_full_{int(time.time()*1000)}.wav"
-        sf.write(str(tmp), y, sr)
-        return [(tmp, 0.0, sr)]
-    hop = max(1, int((seconds - overlap) * sr))
-    out = []
-    i = 0
-    while i < n:
-        j = min(n, i + win)
-        piece = y[i:j, :]  # [L, C]
-        tmp = Path(tempfile.gettempdir()) / f"eg_chunk_{i}_{int(time.time()*1000)}.wav"
-        sf.write(str(tmp), piece, sr)
-        out.append((tmp, i / sr, sr))
-        if j >= n:
-            break
-        i += hop
+    if src_sr == dst_sr:
+        return x_cs.astype(np.float32)
+
+    # soxr
+    try:
+        import soxr  # type: ignore
+        out = [soxr.resample(x_cs[c], src_sr, dst_sr) for c in range(x_cs.shape[0])]
+        # equalize length (guard)
+        L = min(map(len, out))
+        out = np.stack([ch[:L] for ch in out], axis=0)
+        return out.astype(np.float32)
+    except Exception:
+        pass
+
+    # SciPy polyphase
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly  # type: ignore
+        g = gcd(src_sr, dst_sr)
+        up, down = dst_sr // g, src_sr // g
+        out = [resample_poly(x_cs[c], up=up, down=down).astype(np.float32) for c in range(x_cs.shape[0])]
+        L = min(map(len, out))
+        out = np.stack([ch[:L] for ch in out], axis=0)
+        return out
+    except Exception:
+        pass
+
+    # torchaudio windowed-sinc
+    try:
+        import torchaudio  # type: ignore
+        t = torch.from_numpy(x_cs).float()  # [C, S]
+        rs = torchaudio.transforms.Resample(orig_freq=src_sr, new_freq=dst_sr)
+        y = rs(t)  # [C, S']
+        return y.numpy().astype(np.float32)
+    except Exception:
+        pass
+
+    # linear interp fallback (lowest quality)
+    ratio = dst_sr / float(src_sr)
+    n_out = int(round(x_cs.shape[1] * ratio))
+    t_in = np.linspace(0.0, 1.0, x_cs.shape[1], endpoint=False, dtype=np.float64)
+    t_out = np.linspace(0.0, 1.0, n_out, endpoint=False, dtype=np.float64)
+    out = np.stack([np.interp(t_out, t_in, ch) for ch in x_cs], axis=0).astype(np.float32)
     return out
 
+# ---------- chunking & WOLA ----------
+def _hann(L: int) -> np.ndarray:
+    return np.hanning(L).astype(np.float32)
 
-def _overlap_add_multich(chunks: List[Tuple[np.ndarray, int, float]], seconds: float, overlap: float) -> Tuple[np.ndarray, int]:
+def _iter_chunks(total_samples: int, win: int, hop: int) -> List[Tuple[int, int]]:
     """
-    Multi-channel overlap-add with Hann window, preserving channels.
-    chunks: list of (y_cs [C,S], sr, start_seconds)
-    Returns (out_cs [C,S], sr)
+    Yield (start, length) for each chunk to cover [0, total_samples).
     """
-    if not chunks:
-        return np.zeros((1, 1), np.float32), 48000
-    sr = int(chunks[0][1])
-    win = max(1, int(seconds * sr))
-    ends, C0 = [], None
-    for y_cs, _, start in chunks:
-        if y_cs.ndim == 1:
-            y_cs = y_cs[None, :]
-        if C0 is None:
-            C0 = y_cs.shape[0]
-        L = y_cs.shape[1]
-        ends.append(int(start * sr) + L)
-    total = max(ends)
-    acc = np.zeros((C0, total), np.float32)
-    wsum = np.zeros(total, np.float32)
-    w = np.hanning(win).astype(np.float32) if win > 4 else np.ones(win, np.float32)
-    for y_cs, _, start_s in chunks:
-        y_cs = y_cs if y_cs.ndim == 2 else y_cs[None, :]
-        start = int(start_s * sr)
-        L = y_cs.shape[1]
-        ww = w[:L] if L <= w.shape[0] else np.ones(L, np.float32)
-        acc[:, start:start+L] += y_cs[:, :L] * ww[None, :]
-        wsum[start:start+L] += ww
+    spans: List[Tuple[int, int]] = []
+    i = 0
+    while i < total_samples:
+        L = min(win, total_samples - i)
+        spans.append((i, L))
+        if i + L >= total_samples:
+            break
+        i += hop
+    return spans
+
+def _wola_stitch(chunks_pred: List[Tuple[np.ndarray, int, int]], total_len: int, win: int) -> np.ndarray:
+    """
+    Overlap-add predicted chunks with Hann window.
+    chunks_pred: list of (pred_cs [C, L_pred], start, L_in)
+                 L_in = original (unpadded) input length for that chunk
+    Returns [C, total_len].
+    """
+    if not chunks_pred:
+        return np.zeros((1, max(1, total_len)), np.float32)
+
+    C = chunks_pred[0][0].shape[0]
+    acc = np.zeros((C, total_len), np.float32)
+    wsum = np.zeros(total_len, np.float32)
+    w_full = _hann(win)
+
+    for y_cs, start, L_in in chunks_pred:
+        L_pred = y_cs.shape[1]
+        L = min(L_in, L_pred)  # only weight the valid (unpadded) part
+        w = w_full[:L] if L <= win else np.ones(L, np.float32)
+        acc[:, start:start+L] += y_cs[:, :L] * w[None, :]
+        wsum[start:start+L] += w
+
     wsum[wsum == 0] = 1.0
     out = acc / wsum[None, :]
-    return out.astype(np.float32), sr
+    return out.astype(np.float32)
 
-
-# ---------- FlashSR runner ----------
+# ---------- FlashSR loader ----------
 class _FlashSRRunner:
     REQ_SR = 48000
-    CHUNK_SAMPLES = 245760  # 5.12 s @ 48k
-    HF_DATASET = "jakeoneijk/FlashSR_weights"  # dataset repo id
-    HF_FILES = ("student_ldm.pth", "sr_vocoder.pth", "vae.pth")  # required files
+    CHUNK_S = 5.12
+    OVERLAP_S = 0.50
+    CHUNK_SAMPLES = int(REQ_SR * CHUNK_S)  # 245760
 
-    def __init__(self, device: str = "auto", lowpass: bool = False, repo: Optional[Path] = None):
-        self.device = device
-        self.lowpass = lowpass
+    HF_DATASET = "jakeoneijk/FlashSR_weights"
+    HF_FILES = ("student_ldm.pth", "sr_vocoder.pth", "vae.pth")
+
+    def __init__(self, lowpass: bool = False):
+        self.lowpass = bool(lowpass)
         self.ckpt_dir = _audio_models_subdir("flashsr")
-        env_repo = os.environ.get("EGREGORA_FLASHSR_REPO")
-        self.repo_path = Path(env_repo) if env_repo else (repo if repo else (Path(__file__).parents[1] / "deps" / "FlashSR_Inference"))
+        self.repo_path = self._resolve_repo_path()
+        self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._FlashSRClass = None
         self._model = None
-        self._dev = self._pick_device()
-
-        # Ensure weights exist (download if missing)
         self._ensure_weights()
+        self._import()
+        self._ensure_model()
 
-    def _pick_device(self) -> torch.device:
-        if self.device == "cuda":
-            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.device == "cpu":
-            return torch.device("cpu")
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def _resolve_repo_path(self) -> Path:
+        env_repo = os.environ.get("EGREGORA_FLASHSR_REPO")
+        if env_repo:
+            return Path(env_repo)
+        # default: custom_nodes/ComfyUI-Egregora-Audio-Super-Resolution/deps/FlashSR_Inference
+        return _custom_root().parents[0] / "deps" / "FlashSR_Inference"
 
     def _ensure_weights(self):
-        missing = [n for n in self.HF_FILES if not (self.ckpt_dir / n).exists()]
+        missing = [f for f in self.HF_FILES if not (self.ckpt_dir / f).exists()]
         if not missing:
             return
-        print(f"[FlashSR] Missing weights in {self.ckpt_dir}: {', '.join(missing)} — downloading from Hugging Face…")
+        # Try huggingface_hub first
         try:
-            from huggingface_hub import hf_hub_download  # robust/resumable
+            from huggingface_hub import hf_hub_download  # type: ignore
             for fname in missing:
                 hf_hub_download(
                     repo_id=self.HF_DATASET,
                     filename=fname,
                     repo_type="dataset",
-                    local_dir=str(self.ckpt_dir)
+                    local_dir=str(self.ckpt_dir),
                 )
-                print(f"[FlashSR] Downloaded via huggingface_hub: {fname}")
+            print(f"[FlashSR] Downloaded via huggingface_hub: {', '.join(missing)}")
             return
         except Exception as e:
             print(f"[FlashSR] huggingface_hub unavailable or failed ({e}); falling back to direct HTTP…")
+        # Fallback: direct HTTP
         try:
-            import requests
+            import requests  # type: ignore
             for fname in missing:
                 url = f"https://huggingface.co/datasets/{self.HF_DATASET}/resolve/main/{fname}?download=true"
                 dst = self.ckpt_dir / fname
-                with requests.get(url, stream=True, timeout=3600) as r:
+                with requests.get(url, stream=True, timeout=1800) as r:
                     r.raise_for_status()
                     with open(dst, "wb") as f:
                         for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -211,33 +233,30 @@ class _FlashSRRunner:
                 print(f"[FlashSR] Downloaded: {dst}")
         except Exception as ee:
             raise RuntimeError(
-                "FlashSR weights are missing and automatic download failed. "
-                "Place these files into models/audio/flashsr: student_ldm.pth, sr_vocoder.pth, vae.pth"
+                "FlashSR weights missing and auto-download failed. "
+                "Place these in models/audio/flashsr: student_ldm.pth, sr_vocoder.pth, vae.pth"
             ) from ee
 
     def _import(self):
         if self._FlashSRClass is not None:
-            return self._FlashSRClass
+            return
         try:
             from FlashSR.FlashSR import FlashSR  # type: ignore
             self._FlashSRClass = FlashSR
-            return FlashSR
+            return
         except Exception:
             cand = self.repo_path
             if (cand / "FlashSR").exists():
                 sys.path.insert(0, str(cand))
                 from FlashSR.FlashSR import FlashSR  # type: ignore
                 self._FlashSRClass = FlashSR
-                return FlashSR
-            raise RuntimeError(
-                "FlashSR repo not importable. Install jakeoneijk/FlashSR_Inference "
-                "or place it under deps/FlashSR_Inference, or set EGREGORA_FLASHSR_REPO."
-            )
+                return
+        raise RuntimeError("FlashSR module not found. Install/clone and set EGREGORA_FLASHSR_REPO if needed.")
 
     def _ensure_model(self):
         if self._model is not None:
-            return self._model
-        FlashSR = self._import()
+            return
+        FlashSR = self._FlashSRClass
         s = str(self.ckpt_dir / "student_ldm.pth")
         v = str(self.ckpt_dir / "sr_vocoder.pth")
         vae = str(self.ckpt_dir / "vae.pth")
@@ -248,28 +267,16 @@ class _FlashSRRunner:
         except Exception:
             pass
         self._model = model
-        return model
 
-    def run_chunk(self, wav_path: Path) -> Path:
-        y, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
-        cs = _to_cs(y)
-        if sr != self.REQ_SR:
-            cs = _resample_linear(cs, sr, self.REQ_SR)
-        T = cs.shape[1]
-        if T < self.CHUNK_SAMPLES:
-            pad = np.zeros((cs.shape[0], self.CHUNK_SAMPLES - T), np.float32)
-            cs = np.concatenate([cs, pad], axis=1)
-        elif T > self.CHUNK_SAMPLES:
-            cs = cs[:, : self.CHUNK_SAMPLES]
-        audio_t = torch.from_numpy(cs).to(self._dev).float()  # [C,T]
-        model = self._ensure_model()
+    def infer(self, x_cs_48k: np.ndarray) -> np.ndarray:
+        """
+        x_cs_48k: [C, S] float32 at 48 kHz.
+        Returns [C, S] float32 at 48 kHz (same length as input slice passed in).
+        """
+        x = torch.from_numpy(x_cs_48k).to(self._dev).float()  # [C, S]
         with torch.inference_mode():
-            pred = model(audio_t, lowpass_input=bool(self.lowpass))  # [C,T]
-        out = pred.detach().to("cpu").float().numpy()
-        out_wav = Path(tempfile.gettempdir()) / f"eg_flashsr_{int(time.time()*1000)}.wav"
-        sf.write(str(out_wav), out.T, self.REQ_SR)
-        return out_wav
-
+            y = self._model(x, lowpass_input=self.lowpass)  # [C, S]
+        return y.detach().to("cpu").float().numpy()
 
 # ---------- Node ----------
 class EgregoraAudioSuperResolution:
@@ -277,157 +284,66 @@ class EgregoraAudioSuperResolution:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "chunk_seconds": ("FLOAT", {"default": 5.12, "min": 1.0, "max": 120.0, "step": 0.01}),
-                "overlap_seconds": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 5.0, "step": 0.01}),
-                "device": (["auto", "cuda", "cpu"],),
-                "target_sr": (["auto", "48000", "44100", "32000", "22050", "16000"],),
-                "output_format": (["wav", "flac"],),  # container decided by extension
-            },
-            "optional": {
-                "AUDIO": ("AUDIO",),
-                "audio_path": ("STRING", {"default": ""}),
-                "audio_url": ("STRING", {"default": ""}),
-                "flashsr_lowpass": ("BOOLEAN", {"default": False}),
-
-                # ABX helpers
-                "run_abx": ("BOOLEAN", {"default": False}),
-                "clip_seconds": ("FLOAT", {"default": 10.0, "min": 1.0, "max": 60.0, "step": 0.1}),
-                "random_seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1, "step": 1}),
-                "start_seconds": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10000.0, "step": 0.1}),
-
-                # Null-test helper
-                "run_null": ("BOOLEAN", {"default": False}),
-            },
+                "audio": ("AUDIO",),
+                "lowpass_input": ("BOOLEAN", {"default": False}),
+                "output_sr": (["48000", "44100", "96000"], {"default": "48000"}),
+            }
         }
 
-    RETURN_TYPES = RETURN_TYPES
+    RETURN_TYPES = ("AUDIO",)
     FUNCTION = FUNCTION
     CATEGORY = CATEGORY
-    OUTPUT_NODE = True
+    OUTPUT_NODE = False
 
-    def _normalize_audio(self, AUDIO=None, audio_path="", audio_url=""):
-        if isinstance(AUDIO, dict) and "waveform" in AUDIO and "sample_rate" in AUDIO:
-            wf: torch.Tensor = AUDIO["waveform"]
-            sr = int(AUDIO["sample_rate"])
-            if wf.dim() == 3:
-                wf = wf[0]  # [C,T]
-            if wf.dim() != 2:
-                raise RuntimeError(f"Unexpected AUDIO shape: {tuple(wf.shape)} (want [C,T])")
-            cs = wf.detach().cpu().float().numpy()
-            return cs, sr, _save_temp_wav(cs, sr)
+    def run(self, audio=None, lowpass_input=False, output_sr="48000"):
+        # 1) Normalize input to [C, S]
+        in_cs, in_sr = _from_audio_dict(audio)
 
-        if isinstance(AUDIO, (list, tuple)) and len(AUDIO) == 2:
-            arr, sr = AUDIO
-            cs = _to_cs(np.asarray(arr))
-            return cs, int(sr), _save_temp_wav(cs, int(sr))
+        # 2) Resample to model SR if needed
+        runner = _FlashSRRunner(lowpass=bool(lowpass_input))
+        req_sr = runner.REQ_SR
+        if in_sr != req_sr:
+            in_cs = _resample_hq(in_cs, in_sr, req_sr)
+            in_sr = req_sr
 
-        if audio_path:
-            p = Path(audio_path)
-            if not p.exists():
-                raise RuntimeError(f"audio_path not found: {audio_path}")
-            y, sr = sf.read(str(p), dtype="float32", always_2d=False)
-            cs = _to_cs(y)
-            return cs, int(sr), _save_temp_wav(cs, int(sr))
+        # 3) Chunking params (internal, non-user)
+        win = runner.CHUNK_SAMPLES               # 5.12 s @ 48k
+        hop = int((runner.CHUNK_S - runner.OVERLAP_S) * req_sr)
+        if hop <= 0 or hop >= win:
+            # guard-rail: keep a sane overlap in pathological cases
+            hop = win // 2
 
-        if audio_url:
-            import requests
-            r = requests.get(audio_url, timeout=60); r.raise_for_status()
-            p = Path(tempfile.gettempdir()) / f"eg_url_{int(time.time()*1000)}.wav"; p.write_bytes(r.content)
-            y, sr = sf.read(str(p), dtype="float32", always_2d=False)
-            cs = _to_cs(y)
-            return cs, int(sr), _save_temp_wav(cs, int(sr))
+        total = in_cs.shape[1]
+        spans = _iter_chunks(total, win=win, hop=hop)
 
-        raise RuntimeError("No AUDIO provided.")
+        # 4) Process chunks in-memory and stitch with Hann WOLA
+        preds: List[Tuple[np.ndarray, int, int]] = []
+        for start, L in spans:
+            # slice and pad up to win
+            chunk = in_cs[:, start:start+L]
+            if L < win:
+                pad = np.zeros((in_cs.shape[0], win - L), np.float32)
+                chunk = np.concatenate([chunk, pad], axis=1)
+            y_pred = runner.infer(chunk)  # [C, win] @ 48k
+            preds.append((y_pred, start, L))  # keep original L for proper weighting
 
-    def run(
-        self, chunk_seconds, overlap_seconds, device, target_sr, output_format,
-        AUDIO=None, audio_path="", audio_url="", flashsr_lowpass=False,
-        run_abx=False, clip_seconds=10.0, random_seed=0, start_seconds=0.0,
-        run_null=False
-    ):
-        # ---------- Normalize input ----------
-        target_sr_int = 0 if target_sr == "auto" else int(target_sr)
-        in_cs, in_sr, in_wav = self._normalize_audio(AUDIO, audio_path, audio_url)
+        out_48k = _wola_stitch(preds, total_len=total, win=win)  # [C, total]
 
-        # ---------- FlashSR over chunks ----------
-        chunks = _chunker(in_wav, seconds=chunk_seconds, overlap=overlap_seconds)
-        rendered: List[Tuple[np.ndarray, int, float]] = []
+        # 5) Optional post-resample for delivery
+        tgt_sr = int(output_sr)
+        if tgt_sr != in_sr:
+            out = _resample_hq(out_48k, in_sr, tgt_sr)
+            out_sr = tgt_sr
+        else:
+            out, out_sr = out_48k, in_sr
 
-        runner = _FlashSRRunner(device=device, lowpass=bool(flashsr_lowpass))
-        for p, start, _sr in chunks:
-            out = runner.run_chunk(p)  # chunk is rendered at 48k by FlashSR
-            y, sr = sf.read(str(out), dtype="float32", always_2d=False)
-            cs_y = _to_cs(y)  # [C,S]
-            if target_sr_int and target_sr_int != sr:
-                cs_y = _resample_linear(cs_y, sr, target_sr_int)
-                sr = target_sr_int
-            rendered.append((cs_y, sr, start))
+        # 6) Return single AUDIO
+        return (_make_audio(out_sr, out),)
 
-        if not rendered:
-            raise RuntimeError("No chunks rendered; check input and settings.")
-
-        out_cs, out_sr = _overlap_add_multich(rendered, chunk_seconds, overlap_seconds)
-
-        # ---------- Main AUDIO out ----------
-        main_audio = _make_audio(int(out_sr), out_cs)
-
-        # write sidecar file to ComfyUI/output/audio in chosen container
-        ext = ".wav" if output_format == "wav" else ".flac"
-        out_file = _output_dir() / f"flashsr_{int(time.time()*1000)}{ext}"
-        sf.write(str(out_file), out_cs.T, int(out_sr))  # container chosen by extension
-        print(f"[FlashSR] Wrote: {out_file}")
-
-        # ---------- Optional ABX prep ----------
-        abx_A = _make_audio(int(out_sr), _resample_linear(in_cs, in_sr, int(out_sr)))  # resample original to out_sr
-        abx_B = main_audio
-        abx_X = _make_audio(int(out_sr), np.zeros((abx_B['samples'].shape[0], 1), np.float32))
-        abx_meta: Dict[str, Any] = {}
-
-        if bool(run_abx):
-            try:
-                from .egregora_audio_eval_pack import ABX_Prepare  # local helper node
-            except Exception:
-                # fallback to plain prep if the module path differs (e.g., running as a single file)
-                from egregora_audio_eval_pack import ABX_Prepare  # type: ignore
-
-            A_c, B_c, X, meta = ABX_Prepare().execute(
-                abx_A, abx_B, clip_seconds=float(clip_seconds),
-                random_seed=int(random_seed), start_seconds=float(start_seconds)
-            )
-            abx_A, abx_B, abx_X, abx_meta = A_c, B_c, X, dict(meta)
-
-        # ---------- Optional Null test (no plots, just signal+metrics) ----------
-        null_audio = _make_audio(int(out_sr), np.zeros((abx_B['samples'].shape[0], 1), np.float32))
-        null_metrics: Dict[str, Any] = {}
-
-        if bool(run_null):
-            try:
-                from .egregora_null_test_suite import Null_Test_Full
-            except Exception:
-                from egregora_null_test_suite import Null_Test_Full  # type: ignore
-
-            ap_matched, audio_null, delay_ms, gain_db, metrics, _w, _s, _d = Null_Test_Full().execute(
-                audio_ref=abx_A,
-                audio_proc=main_audio,
-                # keep it lightweight: no figures
-                draw_waveforms=False, draw_spectrograms=False, draw_diffspec=False
-            )
-            # we expose only the null and metrics here
-            null_audio = audio_null
-            # include alignment/gain in metrics for convenience
-            mm = dict(metrics or {})
-            mm.update({"delay_ms": float(delay_ms), "gain_db": float(gain_db)})
-            null_metrics = mm
-
-        # Return all outputs (unused ones are harmless)
-        return (main_audio, abx_A, abx_B, abx_X, abx_meta, null_audio, null_metrics)
-
-
-# ComfyUI node registration
+# ComfyUI registration
 NODE_CLASS_MAPPINGS = {
     "EgregoraAudioUpscaler": EgregoraAudioSuperResolution,
 }
-
 NODE_DISPLAY_NAME_MAPPINGS = {
     "EgregoraAudioUpscaler": "🎧 Audio Super Resolution (FlashSR)",
 }
