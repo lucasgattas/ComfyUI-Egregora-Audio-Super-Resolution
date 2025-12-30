@@ -65,7 +65,7 @@ A focused audio toolkit for ComfyUI: upscale, enhance, and evaluate audio qualit
 **Purpose:** CPU fallback using FFTW. Same idea as GPU but slower.
 
 **Use case:**
-- When you don?t have CUDA/CuPy
+- When you don´t have CUDA/CuPy
 
 ---
 
@@ -132,7 +132,7 @@ Restart ComfyUI once.
 ---
 
 ### 2) Install dependencies (recommended)
-Use ComfyUI?s embedded Python:
+Use ComfyUI´s embedded Python:
 
 ```powershell
 python_embeded\python.exe -m pip install -r ComfyUI\custom_nodes\ComfyUI-Egregora-Audio-Super-Resolution
@@ -148,7 +148,13 @@ Notes:
 
 ## FlashSR repo and weights
 
-This project does **not** ship FlashSR code or weights. You must provide the weights:
+The node **auto-downloads the FlashSR inference repo** on first use into `deps/FlashSR_Inference/`:
+https://github.com/jakeoneijk/FlashSR_Inference
+
+However, **FlashSR model weights are not included** in this pack due to licensing/redistribution limits. The weights page does not state a license — download at your own discretion.
+
+You must obtain the weights from the FlashSR authors or their official release and place them here:
+https://huggingface.co/datasets/jakeoneijk/FlashSR_weights
 
 ```
 ComfyUI/models/audio/flashsr/
@@ -157,11 +163,12 @@ ComfyUI/models/audio/flashsr/
   vae.pth
 ```
 
-Optional auto-download from your HF repo:
+Optional auto-download (if *you* host the weights in your own HF repo):
 
 ```powershell
 set EGREGORA_FLASHSR_HF_REPO=yourname/flashsr-weights
 ```
+
 
 ---
 
@@ -208,3 +215,4 @@ python_embeded\python.exe -m pip install "numpy<=1.26.4"
 
 - **v0.2.0** Added Enhance/Eval/Null toolsets; new installer + warmups.
 - **v0.1.0** Initial release: FlashSR SR node, Fat Llama GPU/CPU.
+
