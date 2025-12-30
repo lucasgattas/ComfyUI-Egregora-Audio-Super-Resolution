@@ -1,5 +1,5 @@
 # Core
-numpy>=1.26
+numpy<=1.26.4
 scipy>=1.11
 soundfile>=0.12
 tqdm>=4.66

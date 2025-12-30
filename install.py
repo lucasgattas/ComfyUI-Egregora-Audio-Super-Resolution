@@ -103,7 +103,7 @@ def try_fetch_weights():
 # ---------- New: model/runtime deps + warmups ----------
 def ensure_runtime_deps():
     # keep your requirements light; install optional bits here if missing
-    _ensure("numpy")
+    _ensure("numpy", pip_name="numpy<=1.26.4")
     _ensure("soundfile")
     _ensure("tqdm")
     _ensure("requests")
@@ -124,6 +124,16 @@ def ensure_runtime_deps():
 
     # Optional: SciPy for HQ resampler/metrics in the Eval Pack
     _ensure("scipy")
+
+    # Windows-only: NVIDIA runtime wheels for CuPy (Fat Llama GPU).
+    if sys.platform.startswith("win"):
+        _ensure("nvidia.cuda_runtime", pip_name="nvidia-cuda-runtime-cu12")
+        _ensure("nvidia.cuda_nvrtc", pip_name="nvidia-cuda-nvrtc-cu12")
+        _ensure("nvidia.cublas", pip_name="nvidia-cublas-cu12")
+        _ensure("nvidia.cufft", pip_name="nvidia-cufft-cu12")
+        _ensure("nvidia.curand", pip_name="nvidia-curand-cu12")
+        _ensure("nvidia.cusolver", pip_name="nvidia-cusolver-cu12")
+        _ensure("nvidia.cusparse", pip_name="nvidia-cusparse-cu12")
 
 def warmup_deepfilternet():
     try:

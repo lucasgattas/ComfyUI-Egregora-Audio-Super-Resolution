@@ -11,7 +11,7 @@
 #
 # SPDX: MIT
 
-import os, sys, time
+import os, sys, time, zipfile
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -33,6 +33,84 @@ def _audio_models_subdir(name: str) -> Path:
     d = _models_dir() / "audio" / name
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+def _ensure_flashsr_repo(repo_path: Path, env_repo: Optional[str]) -> None:
+    """
+    Ensure FlashSR_Inference repo exists at repo_path.
+    If EGREGORA_FLASHSR_REPO is set, do not auto-download into a custom path.
+    """
+    marker = repo_path / ".egregora_repo_ok"
+    expected = repo_path / "FlashSR" / "FlashSR.py"
+    if repo_path.exists():
+        if marker.exists():
+            return
+        if expected.exists():
+            try:
+                marker.write_text("ok\n", encoding="utf-8")
+                print(f"[FlashSR] Repo OK: {repo_path}")
+            except Exception:
+                pass
+            return
+
+    if env_repo:
+        raise RuntimeError(
+            "FlashSR repo path does not exist. "
+            f"EGREGORA_FLASHSR_REPO={env_repo} (missing)."
+        )
+
+    repo_path.parent.mkdir(parents=True, exist_ok=True)
+    zpath = repo_path.parent / "FlashSR_Inference.zip"
+
+    print("[FlashSR] Repo missing; downloading FlashSR_Inference...")
+    urls = [
+        "https://github.com/jakeoneijk/FlashSR_Inference/archive/refs/heads/main.zip",
+        "https://codeload.github.com/jakeoneijk/FlashSR_Inference/zip/refs/heads/main",
+    ]
+    last_err = None
+    for url in urls:
+        try:
+            from urllib.request import urlopen
+            with urlopen(url, timeout=180) as r:
+                zpath.write_bytes(r.read())
+            last_err = None
+            print("[FlashSR] Download complete; extracting...")
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err is not None:
+        try:
+            import requests  # type: ignore
+            r = requests.get(urls[-1], timeout=180)
+            r.raise_for_status()
+            zpath.write_bytes(r.content)
+            last_err = None
+            print("[FlashSR] Download complete; extracting...")
+        except Exception as e:
+            last_err = e
+    if last_err is not None:
+        raise RuntimeError(
+            "Failed to download FlashSR_Inference. "
+            f"Zip path: {zpath}. Check your network or manually clone into deps/FlashSR_Inference."
+        ) from last_err
+
+    try:
+        with zipfile.ZipFile(zpath, "r") as zf:
+            zf.extractall(repo_path.parent)
+        inner = next(p for p in repo_path.parent.glob("FlashSR_Inference-*") if p.is_dir())
+        inner.rename(repo_path)
+        if not expected.exists():
+            raise RuntimeError("FlashSR repo downloaded but expected files were not found.")
+        try:
+            marker.write_text("ok\n", encoding="utf-8")
+            print(f"[FlashSR] Repo OK: {repo_path}")
+        except Exception:
+            pass
+    finally:
+        try:
+            zpath.unlink()
+        except Exception:
+            pass
 
 # ---------- AUDIO helpers ----------
 def _make_audio(sr: int, samples_cs: np.ndarray) -> Dict[str, Any]:
@@ -185,16 +263,17 @@ class _FlashSRRunner:
     def __init__(self, lowpass: bool = False):
         self.lowpass = bool(lowpass)
         self.ckpt_dir = _audio_models_subdir("flashsr")
-        self.repo_path = self._resolve_repo_path()
+        self.env_repo = os.environ.get("EGREGORA_FLASHSR_REPO")
+        self.repo_path = self._resolve_repo_path(self.env_repo)
         self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._FlashSRClass = None
         self._model = None
+        _ensure_flashsr_repo(self.repo_path, self.env_repo)
         self._ensure_weights()
         self._import()
         self._ensure_model()
 
-    def _resolve_repo_path(self) -> Path:
-        env_repo = os.environ.get("EGREGORA_FLASHSR_REPO")
+    def _resolve_repo_path(self, env_repo: Optional[str]) -> Path:
         if env_repo:
             return Path(env_repo)
         # default: custom_nodes/ComfyUI-Egregora-Audio-Super-Resolution/deps/FlashSR_Inference
@@ -251,7 +330,18 @@ class _FlashSRRunner:
                 from FlashSR.FlashSR import FlashSR  # type: ignore
                 self._FlashSRClass = FlashSR
                 return
-        raise RuntimeError("FlashSR module not found. Install/clone and set EGREGORA_FLASHSR_REPO if needed.")
+        searched = [
+            "sys.path + default import",
+            str(self.repo_path),
+            str(self.repo_path / "FlashSR"),
+        ]
+        raise RuntimeError(
+            "FlashSR module not found. Ensure FlashSR_Inference is present and importable.\n"
+            f"EGREGORA_FLASHSR_REPO={self.env_repo or ''}\n"
+            f"Resolved repo path: {self.repo_path}\n"
+            f"Searched: {', '.join(searched)}\n"
+            "Tip: run install.py or clone the repo into deps/FlashSR_Inference."
+        )
 
     def _ensure_model(self):
         if self._model is not None:

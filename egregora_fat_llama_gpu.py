@@ -36,6 +36,7 @@ def _save_temp_wav(cs: np.ndarray, sr: int) -> Path:
     sf.write(str(p), cs.T, int(sr))
     return p
 
+
 def _normalize_audio_input(AUDIO=None, audio_path: str = "", audio_url: str = "") -> Tuple[np.ndarray, int, Path]:
     """
     Accept ComfyUI AUDIO dict, or a file path/url; return ([C,S], sr, temp_wav_path).
@@ -93,13 +94,33 @@ def _wire_cuda_for_cupy_windows():
     sp = Path(sys.executable).parent / "Lib" / "site-packages" / "nvidia"
     rt = sp / "cuda_runtime"     # contains include/ and bin/
     nvrtc = sp / "cuda_nvrtc"    # contains bin/
+    embed_rt = Path(__file__).resolve().parents[2] / "python_embeded" / "Lib" / "site-packages" / "nvidia" / "cuda_runtime"
+    embed_nvrtc = Path(__file__).resolve().parents[2] / "python_embeded" / "Lib" / "site-packages" / "nvidia" / "cuda_nvrtc"
 
     # Let CuPy find headers at runtime (NVRTC needs CUDA runtime headers >= CUDA 12.2)
+    cuda_root = None
     if rt.exists():
-        os.environ.setdefault("CUDA_PATH", str(rt))
+        cuda_root = rt
+    elif embed_rt.exists():
+        cuda_root = embed_rt
+
+    if cuda_root is not None:
+        os.environ.setdefault("CUDA_PATH", str(cuda_root))
+        os.environ.setdefault("CUPY_CUDA_PATH", str(cuda_root))
+        os.environ.setdefault("CUDA_HOME", str(cuda_root))
+        if "cupy._environment" in sys.modules:
+            try:
+                import cupy._environment as ce  # type: ignore
+                ce._cuda_path = ""
+                ce._nvcc_path = ""
+                ce.get_cuda_path()
+                ce._setup_win32_dll_directory()
+            except Exception:
+                pass
 
     # Make DLLs loadable for this process (Python 3.8+)
-    for p in (rt / "bin", nvrtc / "bin"):
+    bins = [rt / "bin", nvrtc / "bin", embed_rt / "bin", embed_nvrtc / "bin"]
+    for p in bins:
         if p.exists():
             try:
                 os.add_dll_directory(str(p))
@@ -125,10 +146,16 @@ def _ensure_gpu_stack():
     try:
         import cupy  # noqa: F401  (import after wiring)
     except Exception as e:
+        cmd = (
+            "python_embeded\\python.exe -m pip install -U "
+            "nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cublas-cu12 "
+            "nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 "
+            "cupy-cuda12x"
+        )
         raise RuntimeError(
-            "CuPy failed to import. Ensure you've installed a CUDA-12 build "
-            "(`pip install cupy-cuda12x`) and matching NVIDIA runtime headers & NVRTC "
-            "(`pip install \"nvidia-cuda-runtime-cu12==12.X.*\" \"nvidia-cuda-nvrtc-cu12==12.X.*\"`)."
+            "CuPy failed to import or locate the CUDA runtime. "
+            "Install the NVIDIA runtime wheels and CuPy in the embedded Python, then restart ComfyUI.\n"
+            f"Command: {cmd}"
         ) from e
 
 def _fat_llama_upscale(
@@ -138,10 +165,49 @@ def _fat_llama_upscale(
     max_iterations: int,
     threshold_value: float,
     target_bitrate_kbps: int,
+    toggle_normalize: bool,
     toggle_autoscale: bool,
 ):
     """Call the public API: fat_llama.audio_fattener.feed.upscale(...)"""
-    from fat_llama.audio_fattener.feed import upscale  # late import
+    from fat_llama.audio_fattener import feed  # late import
+
+    if not getattr(feed, "_egregora_read_audio_patch", False):
+        orig_read_audio = feed.read_audio
+
+        def _patched_read_audio(file_path, format):
+            sample_rate, samples, bitrate, audio = orig_read_audio(file_path, format)
+            try:
+                feed._egregora_sample_width = getattr(audio, "sample_width", None)
+            except Exception:
+                pass
+            return sample_rate, samples, bitrate, audio
+
+        feed.read_audio = _patched_read_audio
+        feed._egregora_read_audio_patch = True
+
+    if not getattr(feed, "_egregora_write_audio_patch", False):
+        orig_write_audio = feed.write_audio
+
+        def _patched_write_audio(file_path, sample_rate, data, format):
+            out = data
+            try:
+                m = float(np.max(np.abs(out))) if out is not None else 0.0
+                if m > 1.0:
+                    sw = getattr(feed, "_egregora_sample_width", None)
+                    if sw:
+                        scale = float(2 ** (8 * sw - 1))
+                        if scale > 0:
+                            out = out / scale
+                    else:
+                        out = out / m
+            except Exception:
+                pass
+            return orig_write_audio(file_path, sample_rate, out, format)
+
+        feed.write_audio = _patched_write_audio
+        feed._egregora_write_audio_patch = True
+
+    upscale = feed.upscale
 
     # Normalize ALWAYS on; Adaptive filter disabled for perf/stability
     upscale(
@@ -152,7 +218,7 @@ def _fat_llama_upscale(
         max_iterations=int(max_iterations),
         threshold_value=float(threshold_value),
         target_bitrate_kbps=int(target_bitrate_kbps),
-        toggle_normalize=True,
+        toggle_normalize=bool(toggle_normalize),
         toggle_autoscale=bool(toggle_autoscale),
         toggle_adaptive_filter=False,
     )
@@ -173,6 +239,7 @@ class EgregoraFatLlamaGPU:
                 "max_iterations": ("INT", {"default": 300, "min": 1, "max": 5000}),
                 "threshold_value": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "target_bitrate_kbps": ("INT", {"default": 1411, "min": 64, "max": 5000}),
+                "toggle_normalize": ("BOOLEAN", {"default": True}),
                 "toggle_autoscale": ("BOOLEAN", {"default": True}),
             },
             "optional": {
@@ -193,6 +260,7 @@ class EgregoraFatLlamaGPU:
         max_iterations,
         threshold_value,
         target_bitrate_kbps,
+        toggle_normalize,
         toggle_autoscale,
         AUDIO=None,
         audio_path="",
@@ -215,6 +283,7 @@ class EgregoraFatLlamaGPU:
             max_iterations=max_iterations,
             threshold_value=threshold_value,
             target_bitrate_kbps=target_bitrate_kbps,
+            toggle_normalize=toggle_normalize,
             toggle_autoscale=toggle_autoscale,
         )
 

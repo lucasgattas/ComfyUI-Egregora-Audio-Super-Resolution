@@ -29,6 +29,7 @@ def _save_temp_wav(cs: np.ndarray, sr: int) -> Path:
     sf.write(str(p), cs.T, int(sr))
     return p
 
+
 def _normalize_audio_input(AUDIO=None, audio_path: str="", audio_url: str="") -> Tuple[np.ndarray, int, Path]:
     if isinstance(AUDIO, dict) and "waveform" in AUDIO and "sample_rate" in AUDIO:
         wf: torch.Tensor = AUDIO["waveform"]
@@ -83,7 +84,45 @@ def _fat_llama_fftw_upscale(
 ):
     # Public API (CPU): from fat_llama_fftw.audio_fattener.feed import upscale
     # Example call & params documented in README/example.py.  :contentReference[oaicite:1]{index=1}
-    from fat_llama_fftw.audio_fattener.feed import upscale  # type: ignore
+    from fat_llama_fftw.audio_fattener import feed  # type: ignore
+
+    if not getattr(feed, "_egregora_read_audio_patch", False):
+        orig_read_audio = feed.read_audio
+
+        def _patched_read_audio(file_path, format):
+            sample_rate, samples, bitrate, audio = orig_read_audio(file_path, format)
+            try:
+                feed._egregora_sample_width = getattr(audio, "sample_width", None)
+            except Exception:
+                pass
+            return sample_rate, samples, bitrate, audio
+
+        feed.read_audio = _patched_read_audio
+        feed._egregora_read_audio_patch = True
+
+    if not getattr(feed, "_egregora_write_audio_patch", False):
+        orig_write_audio = feed.write_audio
+
+        def _patched_write_audio(file_path, sample_rate, data, format):
+            out = data
+            try:
+                m = float(np.max(np.abs(out))) if out is not None else 0.0
+                if m > 1.0:
+                    sw = getattr(feed, "_egregora_sample_width", None)
+                    if sw:
+                        scale = float(2 ** (8 * sw - 1))
+                        if scale > 0:
+                            out = out / scale
+                    else:
+                        out = out / m
+            except Exception:
+                pass
+            return orig_write_audio(file_path, sample_rate, out, format)
+
+        feed.write_audio = _patched_write_audio
+        feed._egregora_write_audio_patch = True
+
+    upscale = feed.upscale
     upscale(
         input_file_path=str(in_wav),
         output_file_path=str(out_path),
