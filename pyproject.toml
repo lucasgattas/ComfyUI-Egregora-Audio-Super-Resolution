@@ -1,6 +1,6 @@
 [project]
 name = "egregora-audio-super-resolution"
-description = "High‑quality music audio enhancement for ComfyUI: FlashSR super‑resolution + Fat Llama spectral enhancement (GPU & CPU)."
+description = "✨High‑quality music audio enhancement for ComfyUI: FlashSR Super‑Resolution + Fat Llama spectral enhancement (GPU & CPU)."
 version = "1.0.0"
 license = {file = "LICENSE"} 
 # classifiers = [
