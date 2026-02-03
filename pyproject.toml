@@ -29,7 +29,7 @@ Documentation = "https://github.com/lucasgattas/ComfyUI-Egregora-Audio-Super-Res
 "Bug Tracker" = "https://github.com/lucasgattas/ComfyUI-Egregora-Audio-Super-Resolution/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "mrgattax"
 DisplayName = "ComfyUI-Egregora-Audio-Super-Resolution"
 Icon = ""
 includes = [] 
