@@ -1,5 +1,5 @@
 # Core
-numpy<=1.26.4
+numpy>=1.26
 scipy>=1.11
 soundfile>=0.12
 tqdm>=4.66
@@ -7,9 +7,13 @@ requests>=2.31
 huggingface_hub>=0.24
 
 # Models / processors used by your nodes
-fat-llama>=1.1.0
+# NOTE:
+# - `fat-llama` depends on CUDA/CuPy wheels and is not installable on macOS.
+# - Keep it optional; install manually only on supported CUDA systems.
+#   Example: python -m pip install fat-llama
+# - `deepfilternet` and `descript-audio-codec` are also optional in shared ComfyUI
+#   environments because their transitive dependencies may downgrade core packages
+#   (notably numpy/packaging/protobuf). Install them manually if you need those nodes.
 fat-llama-fftw>=1.0.4.4
 pyrnnoise>=0.3.8
 nara-wpe>=0.0.9          # import name: nara_wpe
-deepfilternet>=0.5.6     # import name: df
-descript-audio-codec>=1.0.0

@@ -21,6 +21,49 @@ import torch
 FUNCTION = "run"
 CATEGORY = "Egregora/Audio"
 
+
+def _best_torch_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _float8_dtypes():
+    names = (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    return tuple(getattr(torch, n) for n in names if hasattr(torch, n))
+
+
+def _coerce_mps_model_dtype(model: Any, device: torch.device):
+    if getattr(device, "type", str(device)) != "mps":
+        return model
+    fp8_types = _float8_dtypes()
+    if not fp8_types:
+        return model
+    has_fp8 = False
+    for p in model.parameters():
+        if p.dtype in fp8_types:
+            has_fp8 = True
+            break
+    if not has_fp8:
+        for b in model.buffers():
+            if b.dtype in fp8_types:
+                has_fp8 = True
+                break
+    if has_fp8:
+        try:
+            model = model.to(dtype=torch.float16)
+            print("[FlashSR] Detected FP8 weights on MPS; cast model to FP16 for compatibility.")
+        except Exception as e:
+            print(f"[FlashSR] FP8->FP16 cast on MPS failed: {e}")
+    return model
+
 # ---------- paths ----------
 def _custom_root() -> Path:
     return Path(__file__).resolve().parent
@@ -265,7 +308,7 @@ class _FlashSRRunner:
         self.ckpt_dir = _audio_models_subdir("flashsr")
         self.env_repo = os.environ.get("EGREGORA_FLASHSR_REPO")
         self.repo_path = self._resolve_repo_path(self.env_repo)
-        self._dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._dev = _best_torch_device()
         self._FlashSRClass = None
         self._model = None
         _ensure_flashsr_repo(self.repo_path, self.env_repo)
@@ -350,10 +393,21 @@ class _FlashSRRunner:
         s = str(self.ckpt_dir / "student_ldm.pth")
         v = str(self.ckpt_dir / "sr_vocoder.pth")
         vae = str(self.ckpt_dir / "vae.pth")
-        model = FlashSR(s, v, vae)
+        # Upstream FlashSR uses torch.load() without map_location, which can fail
+        # on non-CUDA systems when checkpoints were saved from CUDA tensors.
+        orig_torch_load = torch.load
+        def _safe_torch_load(*args, **kwargs):
+            kwargs.setdefault("map_location", "cpu")
+            return orig_torch_load(*args, **kwargs)
+        torch.load = _safe_torch_load
+        try:
+            model = FlashSR(s, v, vae)
+        finally:
+            torch.load = orig_torch_load
         model.eval()
         try:
             model.to(self._dev)
+            model = _coerce_mps_model_dtype(model, self._dev)
         except Exception:
             pass
         self._model = model

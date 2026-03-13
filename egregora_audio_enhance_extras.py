@@ -12,6 +12,7 @@ import io
 import json
 import math
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
@@ -81,7 +82,100 @@ def _to_mono(wav: torch.Tensor):
     return wav.mean(dim=1, keepdim=True)
 
 def _device_for(wav: torch.Tensor):
-    return "cuda" if wav.is_cuda else ("cuda" if torch.cuda.is_available() else "cpu")
+    if getattr(wav, "device", None) is not None and wav.device.type == "mps":
+        return "mps"
+    if wav.is_cuda:
+        return "cuda"
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _float8_dtypes():
+    names = (
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+    )
+    return tuple(getattr(torch, n) for n in names if hasattr(torch, n))
+
+
+def _coerce_model_for_mps(model, device):
+    dev = str(device)
+    if not dev.startswith("mps"):
+        return model
+    fp8_types = _float8_dtypes()
+    if not fp8_types:
+        return model
+    has_fp8 = False
+    for p in model.parameters():
+        if p.dtype in fp8_types:
+            has_fp8 = True
+            break
+    if not has_fp8:
+        for b in model.buffers():
+            if b.dtype in fp8_types:
+                has_fp8 = True
+                break
+    if has_fp8:
+        try:
+            model = model.to(dtype=torch.float16)
+            print("[Egregora] Detected FP8 model on MPS; cast to FP16 for compatibility.")
+        except Exception as e:
+            print(f"[Egregora] FP8->FP16 cast on MPS failed: {e}")
+    return model
+
+
+def _helper_python():
+    p = os.environ.get("EGREGORA_HELPER_PYTHON", "").strip()
+    return p or None
+
+
+def _helper_script():
+    return Path(__file__).resolve().parent / "egregora_audio_extras_helper.py"
+
+
+def _save_audio_for_helper(path: Path, wav: torch.Tensor, sr: int, meta: dict):
+    np.savez_compressed(
+        path,
+        waveform=wav.detach().cpu().numpy().astype(np.float32),
+        sample_rate=np.int64(sr),
+        meta_json=json.dumps(meta or {}),
+    )
+
+
+def _load_audio_from_helper(path: Path):
+    d = np.load(path, allow_pickle=True)
+    wav = torch.from_numpy(d["waveform"]).float()
+    sr = int(d["sample_rate"])
+    meta = json.loads(str(d.get("meta_json", "{}")))
+    return wav, sr, meta
+
+
+def _run_helper(op: str, input_path: Path, output_path: Path, params: dict):
+    py = _helper_python()
+    if not py:
+        raise RuntimeError(
+            f"Missing optional dependency for '{op}'. Set EGREGORA_HELPER_PYTHON to a helper venv "
+            "that has deepfilternet/descript-audio-codec dependencies installed."
+        )
+    script = _helper_script()
+    cmd = [
+        py,
+        str(script),
+        "--op",
+        op,
+        "--in",
+        str(input_path),
+        "--out",
+        str(output_path),
+        "--params",
+        json.dumps(params),
+    ]
+    subprocess.check_call(cmd)
 
 # ----------------------------
 # RNNoise (pyrnnoise)
@@ -115,7 +209,7 @@ class Egregora_RNNoise_Denoise:
 
                 # post gain
                 "post_gain_db": ("FLOAT", {"default": 0.0, "min": -24.0, "max": 24.0, "step": 0.1}),
-                "limit_ceiling": ("BOOL", {"default": True}),
+                "limit_ceiling": ("BOOLEAN", {"default": True}),
                 "ceiling": ("FLOAT", {"default": 0.999, "min": 0.1, "max": 1.0, "step": 0.001}),
             }
         }
@@ -311,14 +405,25 @@ class Egregora_RNNoise_Denoise:
                 vad_s = self._smooth_vad_probs(probs, vad_smooth_ms)
                 s_eff = self._strength_per_frame(strength, vad_s, adaptive_mode, adaptive_amount, vad_threshold)
                 # expand per-frame strengths (10 ms) to per-sample gains
-                if s_eff.ndim == 0:
-                    s_per_sample = np.full(T, float(s_eff), dtype=np.float32)
+                if np.ndim(s_eff) == 0 or np.size(s_eff) <= 1:
+                    s0 = float(np.asarray(s_eff, dtype=np.float32).reshape(-1)[0])
+                    s_per_sample = np.full(T, s0, dtype=np.float32)
                 else:
-                    s_per_sample = np.repeat(s_eff, 480)[:T].astype(np.float32)
+                    s_per_sample = np.repeat(np.asarray(s_eff, dtype=np.float32), 480)
+                    if s_per_sample.shape[0] < T:
+                        s_per_sample = np.pad(s_per_sample, (0, T - s_per_sample.shape[0]), mode="edge")
+                    else:
+                        s_per_sample = s_per_sample[:T]
+                    s_per_sample = s_per_sample.astype(np.float32)
 
                 g_dry_np, g_wet_np = self._gains_from_strength(s_per_sample, mix_curve)
                 g_dry = torch.from_numpy(g_dry_np).to(dry.device)
                 g_wet = torch.from_numpy(g_wet_np).to(dry.device)
+                if wet.shape[0] != dry.shape[0]:
+                    if wet.shape[0] < dry.shape[0]:
+                        wet = torch.nn.functional.pad(wet, (0, dry.shape[0] - wet.shape[0]))
+                    else:
+                        wet = wet[:dry.shape[0]]
 
                 y = g_dry * dry + g_wet * wet
                 y = torch.clamp(y, -1.0, 1.0)
@@ -466,7 +571,7 @@ class Egregora_DeepFilterNet_Denoise:
 
                 # DFN options
                 "dfn_model": (["DeepFilterNet2", "DeepFilterNet3"], {"default": "DeepFilterNet2"}),
-                "device": (["auto", "cuda:0", "cpu"], {"default": "auto"}),
+                "device": (["auto", "cuda:0", "mps", "cpu"], {"default": "auto"}),
 
                 # proper BOOLEAN toggles (not sockets)
                 "use_postfilter": ("BOOLEAN", {"default": False, "label_on": "postfilter on", "label_off": "postfilter off"}),
@@ -503,7 +608,11 @@ class Egregora_DeepFilterNet_Denoise:
     def _pick_device(self, choice: str):
         import torch
         if choice == "auto":
-            return "cuda:0" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                return "cuda:0"
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+            return "cpu"
         return choice
 
     def _df_get(self, model_name: str, device: str):
@@ -513,6 +622,7 @@ class Egregora_DeepFilterNet_Denoise:
             return self._DF_CACHE[key]
         model, df_state, _ = init_df(model_name, config_allow_defaults=True)
         model = model.to(device).eval()
+        model = _coerce_model_for_mps(model, device)
         self._DF_CACHE[key] = (model, df_state)
         return model, df_state
 
@@ -624,8 +734,42 @@ class Egregora_DeepFilterNet_Denoise:
         ceiling=0.98,
     ):
         import torch, numpy as np
-        from df.enhance import enhance
-        from df.io import resample  # DFN tensor resampler (48k native)
+        try:
+            from df.enhance import enhance
+            from df.io import resample  # DFN tensor resampler (48k native)
+            _native_ok = True
+        except Exception:
+            _native_ok = False
+
+        if not _native_ok:
+            wav, sr, meta = _coerce_audio(audio)
+            with tempfile.TemporaryDirectory(prefix="eg_dfn_") as td:
+                tdp = Path(td)
+                inp = tdp / "in_audio.npz"
+                out = tdp / "out_audio.npz"
+                _save_audio_for_helper(inp, wav, sr, meta)
+                _run_helper(
+                    "deepfilternet",
+                    inp,
+                    out,
+                    {
+                        "dfn_model": dfn_model,
+                        "device": device,
+                        "stereo_mode": stereo_mode,
+                        "frame_ms": frame_ms,
+                        "strength": strength,
+                        "mix_curve": mix_curve,
+                        "adaptive_mode": adaptive_mode,
+                        "adaptive_amount": adaptive_amount,
+                        "vad_threshold": vad_threshold,
+                        "vad_smooth_ms": vad_smooth_ms,
+                        "post_gain_db": post_gain_db,
+                        "limit_ceiling": limit_ceiling,
+                        "ceiling": ceiling,
+                    },
+                )
+                wav_o, sr_o, meta_o = _load_audio_from_helper(out)
+                return (_make_audio(sr_o, wav_o, meta_o),)
 
         # 1) Coerce to [B,C,T], then tensorize & resample to 48 kHz (DFN native)
         wav, sr, meta = _coerce_audio(audio)
@@ -738,7 +882,7 @@ class Egregora_DAC_Encode:
             "required": {
                 "audio": ("AUDIO",),
                 "model_type": (["44khz", "24khz", "16khz"], {"default": "44khz"}),
-                "device": (["auto", "cpu", "cuda"], {"default": "auto"}),
+                "device": (["auto", "cpu", "cuda", "mps"], {"default": "auto"}),
             }
         }
 
@@ -750,11 +894,23 @@ class Egregora_DAC_Encode:
     def execute(self, audio, model_type="44khz", device="auto"):
         try:
             import dac
+            _native_ok = True
         except Exception as e:
-            raise RuntimeError("descript-audio-codec not installed. pip install descript-audio-codec") from e
+            _native_ok = False
 
         wav, sr, meta = _coerce_audio(audio)  # [B,C,T] float
         B, C, T = wav.shape
+
+        if not _native_ok:
+            with tempfile.TemporaryDirectory(prefix="eg_dac_enc_") as td:
+                tdp = Path(td)
+                inp = tdp / "in_audio.npz"
+                out = tdp / "codes.pt"
+                _save_audio_for_helper(inp, wav, sr, meta)
+                _run_helper("dac_encode", inp, out, {"model_type": model_type, "device": device})
+                codes_dict = torch.load(out, map_location="cpu")
+                log = codes_dict.pop("log", "DAC encode ok (helper)")
+                return (codes_dict, log)
 
         # Auto-download
         ckpt = dac.utils.download(model_type=model_type)
@@ -762,6 +918,7 @@ class Egregora_DAC_Encode:
 
         dev = _device_for(wav) if device == "auto" else device
         model = model.to(dev)
+        model = _coerce_model_for_mps(model, dev)
 
         # FIX: Get model's expected sample rate
         model_sr = model.sample_rate
@@ -808,7 +965,7 @@ class Egregora_DAC_Decode:
         return {
             "required": {
                 "codes": ("DICT",),
-                "device": (["auto", "cpu", "cuda"], {"default": "auto"}),
+                "device": (["auto", "cpu", "cuda", "mps"], {"default": "auto"}),
             }
         }
 
@@ -820,8 +977,9 @@ class Egregora_DAC_Decode:
     def execute(self, codes, device="auto"):
         try:
             import dac
+            _native_ok = True
         except Exception as e:
-            raise RuntimeError("descript-audio-codec not installed. pip install descript-audio-codec") from e
+            _native_ok = False
 
         model_type = codes.get("model_type", "44khz")
         sr = int(codes.get("sample_rate", 48000))
@@ -830,11 +988,30 @@ class Egregora_DAC_Decode:
         if not latents_b:
             raise ValueError("codes.latents empty")
 
+        if not _native_ok:
+            with tempfile.TemporaryDirectory(prefix="eg_dac_dec_") as td:
+                tdp = Path(td)
+                inp = tdp / "codes.pt"
+                out = tdp / "out_audio.npz"
+                torch.save(codes, inp)
+                _run_helper("dac_decode", inp, out, {"device": device})
+                wav_o, sr_o, meta_o = _load_audio_from_helper(out)
+                log = f"DAC decode ok (helper): model={model_type}, B={wav_o.size(0)}, C={wav_o.size(1)}"
+                return (_make_audio(sr=sr_o, wav=wav_o, meta=meta_o), log)
+
         ckpt = dac.utils.download(model_type=model_type)
         model = dac.DAC.load(ckpt)
 
-        dev = "cuda" if torch.cuda.is_available() and device in ("auto", "cuda") else "cpu"
+        if device == "auto":
+            dev = _device_for(torch.empty(1))
+        elif device == "cuda":
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+        elif device == "mps":
+            dev = "mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"
+        else:
+            dev = "cpu"
         model = model.to(dev)
+        model = _coerce_model_for_mps(model, dev)
 
         outs = []
         with torch.no_grad():

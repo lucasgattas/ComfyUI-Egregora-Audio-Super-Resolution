@@ -11,7 +11,19 @@ def main():
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
 
-    dev = "cuda" if args.device in ("auto","cuda") and torch.cuda.is_available() else "cpu"
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            dev = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            dev = "mps"
+        else:
+            dev = "cpu"
+    elif args.device == "cuda":
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    elif args.device == "mps":
+        dev = "mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"
+    else:
+        dev = "cpu"
     wav, sr = sf.read(args.inp, dtype="float32", always_2d=False)
     if wav.ndim == 2:
         if wav.shape[0] < wav.shape[1]:
