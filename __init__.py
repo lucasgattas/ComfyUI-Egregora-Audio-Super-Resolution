@@ -1,4 +1,16 @@
 # Core nodes you already had
+from pathlib import Path
+
+# Guard against accidental top-level custom_nodes/deps being scanned as a node pack.
+_PKG_DIR = Path(__file__).resolve().parent
+_STRAY_DEPS = _PKG_DIR.parent / "deps"
+if _STRAY_DEPS.exists():
+    print(
+        "[Egregora] Warning: found stray folder at custom_nodes/deps. "
+        "This may cause import warnings in ComfyUI. "
+        "Use custom_nodes/ComfyUI-Egregora-Audio-Super-Resolution/deps instead."
+    )
+
 from .egregora_audio_super_resolution import EgregoraAudioSuperResolution
 from .egregora_fat_llama_gpu import EgregoraFatLlamaGPU
 from .egregora_fat_llama_cpu import EgregoraFatLlamaCPU

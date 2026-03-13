@@ -84,8 +84,8 @@ def _normalize_audio_input(AUDIO=None, audio_path: str = "", audio_url: str = ""
 def _wire_cuda_for_cupy_windows():
     """
     On Windows portable installs, make NVIDIA pip-wheel DLLs & headers discoverable:
-      • Add ...\site-packages\nvidia\<package>\bin to the DLL search path
-      • Point CUDA_PATH to ...\site-packages\nvidia\cuda_runtime (has include/)
+      • Add ...\\site-packages\\nvidia\\<package>\\bin to the DLL search path
+      • Point CUDA_PATH to ...\\site-packages\\nvidia\\cuda_runtime (has include/)
     Must run BEFORE importing cupy.
     """
     if platform.system() != "Windows":
@@ -146,15 +146,21 @@ def _ensure_gpu_stack():
     try:
         import cupy  # noqa: F401  (import after wiring)
     except Exception as e:
-        cmd = (
-            "python_embeded\\python.exe -m pip install -U "
-            "nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cublas-cu12 "
-            "nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 "
-            "cupy-cuda12x"
-        )
+        cmd = " ".join([
+            f'"{sys.executable}"',
+            "-m", "pip", "install", "-U",
+            "nvidia-cuda-runtime-cu12",
+            "nvidia-cuda-nvrtc-cu12",
+            "nvidia-cublas-cu12",
+            "nvidia-cufft-cu12",
+            "nvidia-curand-cu12",
+            "nvidia-cusolver-cu12",
+            "nvidia-cusparse-cu12",
+            "cupy-cuda12x",
+        ])
         raise RuntimeError(
             "CuPy failed to import or locate the CUDA runtime. "
-            "Install the NVIDIA runtime wheels and CuPy in the embedded Python, then restart ComfyUI.\n"
+            "Install the NVIDIA runtime wheels and CuPy in the same Python environment as ComfyUI, then restart ComfyUI.\n"
             f"Command: {cmd}"
         ) from e
 

@@ -32,7 +32,13 @@ def _pip_install(args: list[str]):
     except subprocess.CalledProcessError as e:
         print("[Egregora] pip failed:", e)
 
-def _ensure(import_name: str, pip_name: str | None = None, extra_args: list[str] | None = None, try_no_deps: bool = False):
+def _ensure(
+    import_name: str,
+    pip_name: str | None = None,
+    extra_args: list[str] | None = None,
+    try_no_deps: bool = False,
+    allow_full_deps_retry: bool = True,
+):
     """
     Import a module, installing it if missing. When try_no_deps is True,
     we first attempt '--no-deps' to avoid pulling CPU torch into ComfyUI.
@@ -50,7 +56,14 @@ def _ensure(import_name: str, pip_name: str | None = None, extra_args: list[str]
             importlib.import_module(import_name)
             return True
         except Exception:
-            print(f"[Egregora] '{target}' import still failing; retrying with full deps…")
+            if allow_full_deps_retry:
+                print(f"[Egregora] '{target}' import still failing; retrying with full deps…")
+            else:
+                print(
+                    f"[Egregora] '{target}' import still failing after --no-deps; "
+                    "skipping full dependency install to avoid changing shared environment."
+                )
+                return False
 
     _pip_install([target, *(extra_args or [])])
     try:
@@ -59,6 +72,43 @@ def _ensure(import_name: str, pip_name: str | None = None, extra_args: list[str]
     except Exception as e:
         print(f"[Egregora] Could not import {import_name}: {e}")
         return False
+
+
+def _has_cuda_torch() -> bool:
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _is_truthy_env(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _venv_python_path(venv_dir: Path) -> Path:
+    if os.name == "nt":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
+def _setup_helper_venv_if_requested():
+    if not _is_truthy_env("EGREGORA_SETUP_HELPER_VENV"):
+        return
+    default_dir = PKG / ".egregora-helper-venv"
+    venv_dir = Path(os.environ.get("EGREGORA_HELPER_VENV", str(default_dir))).expanduser().resolve()
+    helper_py = _venv_python_path(venv_dir)
+
+    if not helper_py.exists():
+        print(f"[Egregora] Creating helper venv at: {venv_dir}")
+        venv_dir.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.check_call([sys.executable, "-m", "venv", str(venv_dir)])
+
+    print(f"[Egregora] Installing helper-venv deps using: {helper_py}")
+    subprocess.check_call([str(helper_py), "-m", "pip", "install", "-U", "pip"])
+    subprocess.check_call([str(helper_py), "-m", "pip", "install", "deepfilternet", "descript-audio-codec"])
+    os.environ["EGREGORA_HELPER_PYTHON"] = str(helper_py)
+    print(f"[Egregora] Helper venv ready. EGREGORA_HELPER_PYTHON={helper_py}")
 
 # ---------- Your existing FlashSR bootstrap ----------
 def grab_repo_zip():
@@ -103,7 +153,7 @@ def try_fetch_weights():
 # ---------- New: model/runtime deps + warmups ----------
 def ensure_runtime_deps():
     # keep your requirements light; install optional bits here if missing
-    _ensure("numpy", pip_name="numpy<=1.26.4")
+    _ensure("numpy")
     _ensure("soundfile")
     _ensure("tqdm")
     _ensure("requests")
@@ -112,14 +162,21 @@ def ensure_runtime_deps():
     # Models / processors used by your integrated nodes
     _ensure("pyrnnoise")  # RNNoise bindings
     _ensure("nara_wpe", pip_name="nara-wpe")  # dereverb
-    _ensure("dac", pip_name="descript-audio-codec")  # Descript Audio Codec
+    # Keep optional heavy deps out of shared environments by default.
+    if _is_truthy_env("EGREGORA_INSTALL_OPTIONAL_EXTRAS"):
+        _ensure("dac", pip_name="descript-audio-codec", try_no_deps=True, allow_full_deps_retry=False)
+        _ensure("df", pip_name="deepfilternet", try_no_deps=True, allow_full_deps_retry=False)
+    else:
+        print("[Egregora] Skipping DeepFilterNet/DAC install by default (shared-env safe).")
+        print("[Egregora] Set EGREGORA_INSTALL_OPTIONAL_EXTRAS=1 to attempt no-deps install in current env.")
+        print("[Egregora] For full support, use helper venv and set EGREGORA_HELPER_PYTHON=/path/to/venv/bin/python")
 
-    # DeepFilterNet (df). Try --no-deps first to avoid pulling a CPU torch.
-    # ComfyUI already has torch/torchaudio.
-    _ensure("df", pip_name="deepfilternet", try_no_deps=True)
-
-    # Fat Llama (already in requirements, but double-check)
-    _ensure("fat_llama", pip_name="fat-llama")
+    # Fat Llama GPU package is optional and CUDA/CuPy-specific.
+    # Skip on macOS and non-CUDA environments.
+    if sys.platform != "darwin" and _has_cuda_torch():
+        _ensure("fat_llama", pip_name="fat-llama")
+    else:
+        print("[Egregora] Skipping fat-llama (GPU) install on this platform/environment.")
     _ensure("fat_llama_fftw", pip_name="fat-llama-fftw")
 
     # Optional: SciPy for HQ resampler/metrics in the Eval Pack
@@ -173,6 +230,7 @@ def warmup_rnnoise():
 
 # ---------- Entry ----------
 if __name__ == "__main__":
+    _setup_helper_venv_if_requested()
     ensure_runtime_deps()
     # Keep your original FlashSR bootstrap
     grab_repo_zip()

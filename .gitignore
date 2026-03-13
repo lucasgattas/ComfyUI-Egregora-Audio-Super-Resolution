@@ -13,6 +13,8 @@ venv/
 .env/
 .venv/
 env/
+.egregora-helper-venv/
+.eg-helper/
 
 # OS-specific
 .DS_Store
@@ -45,3 +47,4 @@ hf_cache/
 *.bak
 *.swp
 *.swo
+.tmp_pkg_meta/
